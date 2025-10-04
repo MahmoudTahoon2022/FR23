@@ -1,0 +1,16 @@
+
+[Unit]
+Description=MQTT to Telegram Relay
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/mnt/data/mqtt_telegram_relay_pack/relay
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/mnt/data/mqtt_telegram_relay_pack/relay/.venv/bin/python /mnt/data/mqtt_telegram_relay_pack/relay/relay.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
