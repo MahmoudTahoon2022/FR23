@@ -1,110 +1,116 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "config.h"
 
-#!/usr/bin/env python3
-import os
-import time
-import json
-import signal
-import logging
-from typing import List
-from urllib.parse import quote_plus
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
 
-import paho.mqtt.client as mqtt
-import requests
+unsigned long lastPublish = 0;
+bool doorOpen = false;
+float lastTemp = 4.2;
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+void wifiConnect() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("WiFi connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(400);
+  }
+  Serial.println("\nWiFi OK " + WiFi.localIP().toString());
+}
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger("relay")
+void handleCommand(String cmd) {
+  cmd.trim();
+  cmd.toUpperCase();
 
-# --- Environment / Config ---
-MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_USER = os.getenv("MQTT_USER", "")
-MQTT_PASS = os.getenv("MQTT_PASS", "")
-MQTT_TOPICS = [t.strip() for t in os.getenv("MQTT_TOPICS", "freezer/status,freezer/temp,freezer/door").split(",") if t.strip()]
-MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "mqtt-telegram-relay")
+  if (cmd == "TEMP?") {
+    // هنا بديل للسينسور الحقيقي (للتجربة فقط)
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.2f C", lastTemp);
+    mqtt.publish(TOPIC_TEMP, buf, true);
+  } else if (cmd == "DOOR?") {
+    mqtt.publish(TOPIC_DOOR, doorOpen ? "Door Open" : "Door Closed", true);
+  } else if (cmd == "STATUS?") {
+    String s = "OK IP=" + WiFi.localIP().toString() + " RSSI=" + String(WiFi.RSSI());
+    mqtt.publish(TOPIC_STATUS, s.c_str(), false);
+  } else if (cmd == "REBOOT") {
+    mqtt.publish(TOPIC_STATUS, "Rebooting...", false);
+    delay(200);
+    ESP.restart();
+  }
+}
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHAT_ID = os.getenv("CHAT_ID", "")
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+void onMqtt(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+  String p;
+  p.reserve(length + 1);
+  for (unsigned int i = 0; i < length; i++) p += (char)payload[i];
 
-if not BOT_TOKEN or not CHAT_ID:
-    log.error("BOT_TOKEN and/or CHAT_ID are missing. Create a .env file based on .env.sample.")
-    raise SystemExit(1)
+  if (t == TOPIC_CMD) {
+    handleCommand(p);
+  }
+}
 
-session = requests.Session()
-session.headers.update({"Content-Type": "application/x-www-form-urlencoded"})
+void mqttReconnect() {
+  while (!mqtt.connected()) {
+    Serial.print("Connecting MQTT ... ");
+    if (MQTT_USER[0] != '\0' || MQTT_PASS[0] != '\0') {
+      if (mqtt.connect(DEVICE_TAG, MQTT_USER, MQTT_PASS)) {
+        Serial.println("ok");
+      } else {
+        Serial.println("fail, rc=" + String(mqtt.state()));
+        delay(1000);
+      }
+    } else {
+      if (mqtt.connect(DEVICE_TAG)) {
+        Serial.println("ok");
+      } else {
+        Serial.println("fail, rc=" + String(mqtt.state()));
+        delay(1000);
+      }
+    }
+  }
 
-def send_to_telegram(text: str):
-    try:
-        resp = session.post(TELEGRAM_API, data={
-            "chat_id": CHAT_ID,
-            "text": text
-        }, timeout=10)
-        if resp.status_code != 200:
-            log.warning("Telegram send failed: %s %s", resp.status_code, resp.text[:200])
-    except Exception as e:
-        log.exception("Telegram send error: %s", e)
+  // اشترك في توبك الأوامر بعد الاتصال
+  mqtt.subscribe(TOPIC_CMD, 1);
+  mqtt.publish(TOPIC_STATUS, "✅ " DEVICE_TAG " connected & subscribed to cmd");
+}
 
-# MQTT callbacks
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        log.info("Connected to MQTT %s:%s", MQTT_HOST, MQTT_PORT)
-        for topic in MQTT_TOPICS:
-            client.subscribe(topic, qos=1)
-            log.info("Subscribed to topic: %s", topic)
-        send_to_telegram("✅ Relay connected to MQTT broker and ready.")
-    else:
-        log.error("MQTT connect failed with rc=%s", rc)
+void setup() {
+  Serial.begin(115200);
+  wifiConnect();
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(onMqtt);
+  mqttReconnect();
 
-def on_message(client, userdata, msg):
-    payload = msg.payload.decode(errors="ignore")
-    text = f"📡 *{msg.topic}*\n{payload}"
-    # Telegram MarkdownV2 escaping minimal (we avoid markdown parse by not setting parse_mode)
-    send_to_telegram(text)
+  // إشارة بدء
+  mqtt.publish(TOPIC_STATUS, "✅ " DEVICE_TAG " booted");
+}
 
-def on_disconnect(client, userdata, rc):
-    log.warning("Disconnected from MQTT (rc=%s). Reconnecting...", rc)
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) wifiConnect();
+  if (!mqtt.connected()) mqttReconnect();
+  mqtt.loop();
 
-def main():
-    client = mqtt.Client(client_id=MQTT_CLIENT_ID, clean_session=True)
-    if MQTT_USER or MQTT_PASS:
-        client.username_pw_set(MQTT_USER, MQTT_PASS)
-    client.on_connect = on_connect
-    client.on_message = on_message
-    client.on_disconnect = on_disconnect
+  // جزء تجريبي للنشر الدوري كما في كودك الحالي
+  unsigned long now = millis();
+  if (now - lastPublish > 5000) {
+    lastPublish = now;
 
-    client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
+    // حرارة وهمية للتجارب
+    lastTemp += 0.1;
+    if (lastTemp > 6.0) lastTemp = 4.0;
 
-    # Graceful shutdown
-    stop = False
-    def handle_sig(*_):
-        nonlocal stop
-        stop = True
-        log.info("Stopping relay ...")
-    signal.signal(signal.SIGINT, handle_sig)
-    signal.signal(signal.SIGTERM, handle_sig)
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.2f C", lastTemp);
+    mqtt.publish(TOPIC_TEMP, buf, true);
 
-    # Loop forever with reconnect
-    while not stop:
-        try:
-            client.loop(timeout=1.0)
-            time.sleep(0.05)
-        except Exception as e:
-            log.exception("MQTT loop error: %s", e)
-            time.sleep(2)
+    // حالة باب تتبدل للتجارب
+    doorOpen = !doorOpen;
+    mqtt.publish(TOPIC_DOOR, doorOpen ? "Door Open" : "Door Closed", true);
 
-    try:
-        client.disconnect()
-    except Exception:
-        pass
-
-if __name__ == "__main__":
-    main()
+    mqtt.publish(TOPIC_STATUS, "Heartbeat");
+  }
+}
